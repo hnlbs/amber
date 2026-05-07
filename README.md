@@ -108,6 +108,85 @@ curl "http://localhost:8080/api/v1/services" \
   -H "Authorization: Bearer <key>"
 ```
 
+### Log Query Parameters
+
+`GET /api/v1/logs` supports:
+
+| Parameter | Description |
+|-----------|-------------|
+| `service` | Comma-separated service names |
+| `level` | Comma-separated levels (`ERROR,WARN,...`) |
+| `host` | Comma-separated host names |
+| `q` | Full-text search in log body |
+| `from` / `to` | RFC3339 time range |
+| `limit` | Page size (default `100`) |
+| `offset` | Result offset |
+| `attr.<key>` | Exact match on structured attribute |
+
+Examples:
+
+```bash
+# Time-bounded search
+curl "http://localhost:8080/api/v1/logs?service=checkout&from=2026-05-07T10:00:00Z&to=2026-05-07T11:00:00Z&q=timeout"
+
+# Filter by structured attribute
+curl "http://localhost:8080/api/v1/logs?service=checkout&attr.env=prod&attr.region=eu-west-1"
+
+# NDJSON streaming-friendly output
+curl "http://localhost:8080/api/v1/logs?service=checkout&limit=100" \
+  -H "Accept: application/x-ndjson"
+```
+
+### Trace API
+
+```bash
+# Trace list
+curl "http://localhost:8080/api/v1/traces?service=checkout&limit=20&offset=0" \
+  -H "Authorization: Bearer <key>"
+
+# Single trace with span tree + correlated logs
+curl "http://localhost:8080/api/v1/traces/<trace_id>" \
+  -H "Authorization: Bearer <key>"
+```
+
+`GET /api/v1/traces` supports:
+
+| Parameter | Description |
+|-----------|-------------|
+| `service` | Comma-separated service names |
+| `from` / `to` | RFC3339 time range |
+| `limit` | Number of traces to return (default `20`) |
+| `offset` | Trace offset |
+
+Response fields for each trace summary:
+
+- `trace_id`
+- `service`
+- `operation`
+- `start_time`
+- `duration_ms`
+- `span_count`
+- `has_errors`
+
+### Admin API
+
+```bash
+# Runtime + storage stats
+curl "http://localhost:8080/api/v1/admin/stats" \
+  -H "Authorization: Bearer <key>"
+
+# Segment metadata
+curl "http://localhost:8080/api/v1/admin/segments" \
+  -H "Authorization: Bearer <key>"
+```
+
+`/api/v1/admin/stats` includes:
+
+- segment counts and total records
+- active segment metadata
+- sparse index size
+- heap usage snapshot
+
 ## Configuration
 
 See [config.example.yaml](config.example.yaml) for all options. Key settings:
@@ -116,8 +195,10 @@ See [config.example.yaml](config.example.yaml) for all options. Key settings:
 |---------|---------|-------------|
 | `storage.data_dir` | `./data` | Data directory |
 | `storage.segment_max_records` | `1000000` | Records per segment before rotation |
+| `storage.index_cache_size` | `32` | Max sealed index readers kept in memory |
 | `ingest.batch_size` | `1000` | WAL batch size |
 | `ingest.batch_timeout` | `100ms` | Max wait before flushing batch |
+| `ingest.queue_size` | `100000` | Buffered ingest queue length |
 | `api.http_addr` | `:8080` | HTTP listen address |
 | `api.grpc_addr` | `:4317` | gRPC listen address (OTLP) |
 | `api.api_key` | _(empty)_ | Bearer token (empty = auth disabled) |
