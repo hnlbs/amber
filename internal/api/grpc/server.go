@@ -8,10 +8,15 @@ import (
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
 
-	"github.com/hnlbs/amber/internal/ingest"
+	"github.com/hnlbs/amber/internal/model"
 )
 
-func NewServer(batcher *ingest.Batcher, log *slog.Logger) *grpc.Server {
+type sender interface {
+	SendLog(model.LogEntry) error
+	SendSpan(model.SpanEntry) error
+}
+
+func NewServer(batcher sender, log *slog.Logger) *grpc.Server {
 	s := grpc.NewServer()
 	collectorlogs.RegisterLogsServiceServer(s, &logsServer{batcher: batcher, log: log})
 	collectortrace.RegisterTraceServiceServer(s, &tracesServer{batcher: batcher, log: log})

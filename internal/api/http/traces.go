@@ -31,10 +31,12 @@ type traceSummary struct {
 	HasErrors  bool      `json:"has_errors"`
 }
 
+const traceSummaryPageSize = 2000
+
 func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	sq := &query.SpanQuery{Limit: 2000}
+	sq := query.SpanQuery{}
 
 	if v := q.Get("service"); v != "" {
 		sq.Services = splitComma(v)
@@ -69,20 +71,17 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result, err := h.exec.ExecSpan(r.Context(), sq)
+	summaries, total, err := collectTraceSummaries(
+		func(q *query.SpanQuery) (*query.SpanResult, error) {
+			return h.exec.ExecSpan(r.Context(), q)
+		},
+		sq,
+	)
 	if err != nil {
 		h.log.Error("traces list query failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "query failed")
 		return
 	}
-
-	summaries := buildTraceSummaries(result.Spans)
-
-	sort.Slice(summaries, func(i, j int) bool {
-		return summaries[i].StartTime.After(summaries[j].StartTime)
-	})
-
-	total := len(summaries)
 	if offset >= total {
 		summaries = nil
 	} else {
@@ -96,6 +95,35 @@ func (h *TracesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"traces": summaries,
 		"total":  total,
 	})
+}
+
+func collectTraceSummaries(
+	fetch func(*query.SpanQuery) (*query.SpanResult, error),
+	base query.SpanQuery,
+) ([]traceSummary, int, error) {
+	page := base
+	page.Limit = traceSummaryPageSize
+	page.Offset = 0
+
+	var allSpans []model.SpanEntry
+	for {
+		result, err := fetch(&page)
+		if err != nil {
+			return nil, 0, err
+		}
+		allSpans = append(allSpans, result.Spans...)
+
+		if !result.Truncated || len(result.Spans) == 0 {
+			break
+		}
+		page.Offset += len(result.Spans)
+	}
+
+	summaries := buildTraceSummaries(allSpans)
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].StartTime.After(summaries[j].StartTime)
+	})
+	return summaries, len(summaries), nil
 }
 
 func buildTraceSummaries(spans []model.SpanEntry) []traceSummary {
