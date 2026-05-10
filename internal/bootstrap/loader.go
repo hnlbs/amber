@@ -1,6 +1,11 @@
+// Package bootstrap walks segments at startup, builds missing indexes, and
+// installs seal callbacks that build indexes when a segment is rotated. Both
+// paths are best-effort: a build failure logs and increments a metric, then
+// the on-demand index paths in query.Executor cover the gap.
 package bootstrap
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,11 +19,11 @@ import (
 	"github.com/hnlbs/amber/internal/storage"
 )
 
-// retryBuild runs fn up to 3 times with exponential backoff (100ms, 500ms).
-// The seal callback is fire-and-forget — there's no upstream to bubble errors
-// to — so on final failure we bump the metric and let the on-demand index
-// build paths in Executor cover the gap.
-func retryBuild(name string, log *slog.Logger, fn func() error) error {
+// retryBuild runs fn up to 3 times with exponential backoff (100ms, 500ms),
+// returning early if ctx is cancelled. Bumping the metric and surrendering
+// to the on-demand build path is acceptable on persistent failure — the
+// caller (seal callback) is fire-and-forget and has no upstream to notify.
+func retryBuild(ctx context.Context, name string, log *slog.Logger, fn func() error) error {
 	delays := []time.Duration{100 * time.Millisecond, 500 * time.Millisecond}
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -30,13 +35,18 @@ func retryBuild(name string, log *slog.Logger, fn func() error) error {
 		}
 		if attempt < len(delays) {
 			log.Warn("seal: build failed, retrying", "step", name, "attempt", attempt+1, "err", err)
-			time.Sleep(delays[attempt])
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delays[attempt]):
+			}
 		}
 	}
 	return err
 }
 
 func LoadSealedIndexes(
+	ctx context.Context,
 	exec *query.Executor,
 	logManager, spanManager *storage.SegmentManager,
 	logDir, spanDir string,
@@ -47,11 +57,12 @@ func LoadSealedIndexes(
 		workers = 2
 	}
 
-	loadLogSegments(exec, logManager, logDir, workers, log)
-	loadSpanSegments(exec, spanManager, spanDir, workers, log)
+	loadLogSegments(ctx, exec, logManager, logDir, workers, log)
+	loadSpanSegments(ctx, exec, spanManager, spanDir, workers, log)
 }
 
 func loadLogSegments(
+	ctx context.Context,
 	exec *query.Executor,
 	logManager *storage.SegmentManager,
 	logDir string,
@@ -66,9 +77,12 @@ func loadLogSegments(
 	jobs := make(chan storage.SegmentMeta, len(segs))
 	var wg sync.WaitGroup
 
-	for i := 0; i < workers; i++ {
+	for range workers {
 		wg.Go(func() {
 			for seg := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				segPath := filepath.Join(logDir, seg.FileName)
 
 				bidxPath := filepath.Join(logDir, seg.FileName+".bidx")
@@ -112,6 +126,7 @@ func loadLogSegments(
 }
 
 func loadSpanSegments(
+	ctx context.Context,
 	exec *query.Executor,
 	spanManager *storage.SegmentManager,
 	spanDir string,
@@ -129,6 +144,9 @@ func loadSpanSegments(
 	for range workers {
 		wg.Go(func() {
 			for seg := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				segPath := filepath.Join(spanDir, seg.FileName)
 
 				bidxPath := filepath.Join(spanDir, seg.FileName+".bidx")
@@ -157,6 +175,7 @@ func loadSpanSegments(
 }
 
 func SetupSealCallbacks(
+	ctx context.Context,
 	exec *query.Executor,
 	logManager, spanManager *storage.SegmentManager,
 	logDir, spanDir string,
@@ -165,7 +184,7 @@ func SetupSealCallbacks(
 	logManager.SetOnSeal(func(meta storage.SegmentMeta) {
 		segPath := filepath.Join(logDir, meta.FileName)
 
-		if err := retryBuild("log bitmap", log, func() error {
+		if err := retryBuild(ctx, "log bitmap", log, func() error {
 			_, err := index.BuildLogBitmapIndex(segPath, log)
 			return err
 		}); err != nil {
@@ -173,7 +192,7 @@ func SetupSealCallbacks(
 			log.Error("seal: build log bitmap gave up", "segment", meta.FileName, "err", err)
 		}
 
-		if err := retryBuild("log fts", log, func() error {
+		if err := retryBuild(ctx, "log fts", log, func() error {
 			_, err := index.BuildLogFTSIndex(segPath, log)
 			return err
 		}); err != nil {
@@ -182,7 +201,7 @@ func SetupSealCallbacks(
 		}
 
 		var logRibbon *index.RibbonFilter
-		if err := retryBuild("log ribbon", log, func() error {
+		if err := retryBuild(ctx, "log ribbon", log, func() error {
 			r, err := index.BuildLogRibbonFilter(segPath, log)
 			logRibbon = r
 			return err
@@ -194,7 +213,7 @@ func SetupSealCallbacks(
 		}
 
 		var ftsRibbon *index.RibbonFilter
-		if err := retryBuild("log fts ribbon", log, func() error {
+		if err := retryBuild(ctx, "log fts ribbon", log, func() error {
 			r, err := index.BuildLogFTSRibbon(segPath, log)
 			ftsRibbon = r
 			return err
@@ -209,7 +228,7 @@ func SetupSealCallbacks(
 	spanManager.SetOnSeal(func(meta storage.SegmentMeta) {
 		segPath := filepath.Join(spanDir, meta.FileName)
 
-		if err := retryBuild("span bitmap", log, func() error {
+		if err := retryBuild(ctx, "span bitmap", log, func() error {
 			_, err := index.BuildSpanBitmapIndex(segPath, log)
 			return err
 		}); err != nil {
@@ -218,7 +237,7 @@ func SetupSealCallbacks(
 		}
 
 		var spanRibbon *index.RibbonFilter
-		if err := retryBuild("span ribbon", log, func() error {
+		if err := retryBuild(ctx, "span ribbon", log, func() error {
 			r, err := index.BuildSpanRibbonFilter(segPath, log)
 			spanRibbon = r
 			return err

@@ -128,13 +128,15 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 		logDir, spanDir, cfg.IndexCacheSize,
 	)
 
-	bootstrap.SetupSealCallbacks(exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
+	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
 
 	ready := &atomic.Bool{}
 	go func() {
-		bootstrap.LoadSealedIndexes(exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
-		ready.Store(true)
-		cfg.Logger.Info("sealed indexes loaded")
+		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
+		if ctx.Err() == nil {
+			ready.Store(true)
+			cfg.Logger.Info("sealed indexes loaded")
+		}
 	}()
 
 	var guard *ingest.CardinalityGuard
