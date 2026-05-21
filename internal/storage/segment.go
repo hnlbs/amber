@@ -562,7 +562,7 @@ func (sr *SegmentReader) readFooter() error {
 	blockCount := readUint32(r)
 	sr.footer.BlockCount = blockCount
 	sr.footer.BlockOffsets = make([]int64, blockCount)
-	for i := uint32(0); i < blockCount; i++ {
+	for i := range blockCount {
 		sr.footer.BlockOffsets[i] = int64(readUint64(r))
 	}
 
@@ -570,7 +570,7 @@ func (sr *SegmentReader) readFooter() error {
 		expected := int(blockCount) * 16
 		if r.Len() >= expected {
 			sr.footer.BlockStats = make([]BlockStat, blockCount)
-			for i := uint32(0); i < blockCount; i++ {
+			for i := range blockCount {
 				sr.footer.BlockStats[i].MinID = readUint64(r)
 				sr.footer.BlockStats[i].MaxID = readUint64(r)
 			}
@@ -714,22 +714,24 @@ func (sr *SegmentReader) scanBlock(offset int64, fn func(data []byte) error) err
 		return fmt.Errorf("segment: decompress block at %d: %w", offset, err)
 	}
 
-	r := bytes.NewReader(uncompressed)
-	for r.Len() > 0 {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			return fmt.Errorf("segment: read record length: %w", err)
+	// Walk the uncompressed buffer directly instead of bytes.NewReader +
+	// per-record make([]byte, length). Each fn call gets a zero-copy slice
+	// into the already-decompressed block; callers that need to retain the
+	// data (DecodeBytes, etc.) copy out of it themselves.
+	pos := 0
+	for pos < len(uncompressed) {
+		if pos+4 > len(uncompressed) {
+			return fmt.Errorf("segment: truncated record length at block offset %d", offset)
 		}
-		length := binary.LittleEndian.Uint32(lenBuf[:])
-
-		data := make([]byte, length)
-		if _, err := io.ReadFull(r, data); err != nil {
-			return fmt.Errorf("segment: read record data: %w", err)
+		length := int(binary.LittleEndian.Uint32(uncompressed[pos:]))
+		pos += 4
+		if pos+length > len(uncompressed) {
+			return fmt.Errorf("segment: truncated record data at block offset %d", offset)
 		}
-
-		if err := fn(data); err != nil {
+		if err := fn(uncompressed[pos : pos+length]); err != nil {
 			return err
 		}
+		pos += length
 	}
 
 	return nil

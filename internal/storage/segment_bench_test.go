@@ -91,10 +91,7 @@ func prepareSealedSegment(b *testing.B, recordCount int) string {
 	const chunk = 1000
 	full := benchSetupBatch(b, chunk)
 	for written := 0; written < recordCount; written += chunk {
-		n := chunk
-		if recordCount-written < chunk {
-			n = recordCount - written
-		}
+		n := min(recordCount-written, chunk)
 		if err := mgr.WriteBatch(full[:n]); err != nil {
 			b.Fatalf("WriteBatch: %v", err)
 		}
@@ -111,14 +108,57 @@ func prepareSealedSegment(b *testing.B, recordCount int) string {
 	return path
 }
 
+// BenchmarkSegmentReader_ScanFiltered_100k measures the R1 query path:
+// full-segment scan with a 4% allowedIDs bitmap (service+level selectivity).
+// This is the hot path that determines R1 latency in loadbench.
+func BenchmarkSegmentReader_ScanFiltered_100k(b *testing.B) {
+	path := prepareSealedSegment(b, 100_000)
+
+	// Build a bitmap with every 25th ID to simulate 4% selectivity
+	// (service=svc-00 AND level=ERROR with 5 services × 5 levels).
+	type roaringLike interface {
+		Contains(uint64) bool
+	}
+	allowed := make(map[uint64]struct{}, 4000)
+	for i := uint64(15); i < 100_000; i += 25 {
+		allowed[i] = struct{}{}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		sr, err := OpenSegmentReader(path, nil)
+		if err != nil {
+			b.Fatalf("OpenSegmentReader: %v", err)
+		}
+		matched := 0
+		_ = sr.Scan(func(data []byte) error {
+			if len(data) < 10 {
+				return nil
+			}
+			// Peek ID (bytes 2-9, big-endian, matching model.EntryIDToUint64)
+			id := uint64(data[2])<<56 | uint64(data[3])<<48 | uint64(data[4])<<40 |
+				uint64(data[5])<<32 | uint64(data[6])<<24 | uint64(data[7])<<16 |
+				uint64(data[8])<<8 | uint64(data[9])
+			if _, ok := allowed[id]; ok {
+				matched++
+			}
+			return nil
+		})
+		sr.Close()
+		_ = matched
+	}
+	b.ReportMetric(float64(b.N)*100_000/b.Elapsed().Seconds(), "records/sec")
+}
+
 // BenchmarkOpenSegmentReader_WithFooter_10k measures the happy path: footer
 // is present, no need to scan blocks. This is what we pay on every cold open
 // of a properly-sealed segment.
 func BenchmarkOpenSegmentReader_WithFooter_10k(b *testing.B) {
 	path := prepareSealedSegment(b, 10_000)
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		sr, err := OpenSegmentReader(path, nil)
 		if err != nil {
 			b.Fatalf("OpenSegmentReader: %v", err)
