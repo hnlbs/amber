@@ -190,6 +190,48 @@ func BenchmarkExecLog_TimeRangePruning_100seg(b *testing.B) {
 	runExecLogBench(b, exec, q)
 }
 
+// BenchmarkExecLog_LazyDecode_TimeRangeOnly drives a query that has no
+// service/host/level filter, so the bitmap pre-filter contributes nothing
+// and every record reaches the decode-then-time-check path. Used to size
+// the upper bound of a lazy-decode win: the gap between this and
+// _Sealed_1seg_100k (which has Limit-bounded scan termination) tells us
+// roughly how much decode work goes into records that fail the time
+// check. To make the time range cut a substantial fraction of records
+// without help from the sparse index, we ask for a slice in the middle
+// of the segment's hour.
+func BenchmarkExecLog_LazyDecode_TimeRangeOnly(b *testing.B) {
+	exec, cleanup := buildSealedDataset(b, 1, 100_000)
+	defer cleanup()
+
+	// The segment covers exactly 1 hour. Ask for a 30-minute window starting
+	// 15 minutes in: half the records pass time-range, half don't, all are
+	// currently decoded in full.
+	base := time.Now().Add(-time.Hour)
+	q := &LogQuery{
+		From:  base.Add(15 * time.Minute),
+		To:    base.Add(45 * time.Minute),
+		Limit: 1_000_000, // disable early termination
+	}
+	runExecLogBench(b, exec, q)
+}
+
+// BenchmarkExecLog_LazyDecode_SelectiveService combines a service filter
+// (bitmap pre-filter ~1/5 of records) with a wide time range. Hot path:
+// allowedIDs bitmap test → DecodeBytes → matchesAttrs. The wasted work
+// is decoding records that pass the bitmap but fail attrs (which here
+// is the `env=prod` attr — set on every record, so this should be 0%
+// waste in this dataset). The dataset is intentionally homogeneous so
+// we can isolate decode cost from filter cost.
+func BenchmarkExecLog_LazyDecode_SelectiveService(b *testing.B) {
+	exec, cleanup := buildSealedDataset(b, 1, 100_000)
+	defer cleanup()
+	q := &LogQuery{
+		Services: []string{"api-gateway"},
+		Limit:    1_000_000,
+	}
+	runExecLogBench(b, exec, q)
+}
+
 // BenchmarkExecLog_ResultCacheHit measures the warm path that the existing
 // /benchmarks suite accidentally measures everywhere: identical query, cache
 // stays populated. The delta versus _Sealed_10seg_10k is the value of the
