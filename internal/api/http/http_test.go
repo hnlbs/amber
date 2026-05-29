@@ -11,14 +11,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
-func TestAPIKeyMiddleware_EmptyKey(t *testing.T) {
-	handler := APIKeyMiddleware("", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestAPIKeyMiddleware_NoKeysDisablesAuth(t *testing.T) {
+	handler := APIKeyMiddleware(nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -27,29 +28,44 @@ func TestAPIKeyMiddleware_EmptyKey(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Errorf("empty key should pass all requests, got %d", rec.Code)
+		t.Errorf("empty key list should pass all requests, got %d", rec.Code)
 	}
 }
 
-func TestAPIKeyMiddleware_ValidKey(t *testing.T) {
-	handler := APIKeyMiddleware("secret", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+func TestAPIKeyMiddleware_MatchesByName(t *testing.T) {
+	var seenName string
+	handler := APIKeyMiddleware(
+		[]config.NamedAPIKey{
+			{Name: "ops", Key: "secret-ops"},
+			{Name: "billing", Key: "secret-billing"},
+		},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			name, _ := APIKeyNameFromContext(r.Context())
+			seenName = name
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
 
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Authorization", "Bearer secret-billing")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Errorf("valid key should pass, got %d", rec.Code)
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if seenName != "billing" {
+		t.Errorf("api key name in ctx: got %q, want %q", seenName, "billing")
 	}
 }
 
-func TestAPIKeyMiddleware_InvalidKey(t *testing.T) {
-	handler := APIKeyMiddleware("secret", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
+func TestAPIKeyMiddleware_RejectsUnknownKey(t *testing.T) {
+	handler := APIKeyMiddleware(
+		[]config.NamedAPIKey{{Name: "ops", Key: "secret"}},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+	)
 
 	cases := []struct {
 		name string

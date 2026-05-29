@@ -174,3 +174,32 @@ storage:
 		t.Errorf("HTTPAddr should keep default: got %q", cfg.API.HTTPAddr)
 	}
 }
+
+func TestResolvedAPIKeys_NamedListWins(t *testing.T) {
+	cfg := APIConfig{
+		APIKey: "legacy",
+		APIKeys: []NamedAPIKey{
+			{Name: "ops", Key: "k1"},
+			{Name: "billing", Key: "k2"},
+		},
+	}
+	got := cfg.ResolvedAPIKeys()
+	if len(got) != 2 || got[0].Name != "ops" || got[1].Name != "billing" {
+		t.Errorf("named list ignored: %+v", got)
+	}
+}
+
+func TestResolvedAPIKeys_LegacyFallback(t *testing.T) {
+	cfg := APIConfig{APIKey: "legacy"}
+	got := cfg.ResolvedAPIKeys()
+	if len(got) != 1 || got[0].Name != "default" || got[0].Key != "legacy" {
+		t.Errorf("legacy fallback wrong: %+v", got)
+	}
+}
+
+func TestResolvedAPIKeys_EmptyDisables(t *testing.T) {
+	cfg := APIConfig{}
+	if got := cfg.ResolvedAPIKeys(); got != nil {
+		t.Errorf("empty config should disable auth, got %+v", got)
+	}
+}

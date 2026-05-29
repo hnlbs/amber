@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/query"
@@ -23,7 +24,10 @@ type RoutesDeps struct {
 }
 
 type RoutesConfig struct {
-	APIKey          string
+	// APIKeys, when non-empty, gates every non-health route. Empty disables
+	// auth (single-node / dev). Use config.APIConfig.ResolvedAPIKeys() at
+	// wire-up time to merge legacy api_key with the named-list form.
+	APIKeys         []config.NamedAPIKey
 	MaxRequestBytes int64
 }
 
@@ -35,11 +39,14 @@ func RegisterRoutes(mux *http.ServeMux, deps RoutesDeps, cfg RoutesConfig) {
 
 	mux.Handle("GET /readyz", ReadyHandler(deps.IsReady))
 
+	access := func(h http.Handler) http.Handler {
+		return AccessLogMiddleware(deps.Logger, h)
+	}
 	auth := func(h http.Handler) http.Handler {
-		return APIKeyMiddleware(cfg.APIKey, h)
+		return APIKeyMiddleware(cfg.APIKeys, access(h))
 	}
 	authPost := func(h http.Handler) http.Handler {
-		return APIKeyMiddleware(cfg.APIKey, MaxBytesMiddleware(cfg.MaxRequestBytes, h))
+		return APIKeyMiddleware(cfg.APIKeys, access(MaxBytesMiddleware(cfg.MaxRequestBytes, h)))
 	}
 
 	mux.Handle("POST /api/v1/logs", authPost(NewIngestHandler(deps.Batcher, deps.Logger)))
