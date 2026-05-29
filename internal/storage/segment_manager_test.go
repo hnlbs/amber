@@ -406,3 +406,89 @@ func TestDeleteSegmentFiles_CoversAllSidecars(t *testing.T) {
 		t.Errorf(".pidx not deleted; SegmentSidecarExts regressed")
 	}
 }
+
+func TestUploadState_PendingAndMarkUploaded(t *testing.T) {
+	sm, _ := newTestManager(t)
+	writeN(t, sm, 3)
+	if err := sm.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	writeN(t, sm, 3)
+	if err := sm.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+
+	pending := sm.PendingUploads()
+	if len(pending) != 2 {
+		t.Fatalf("pending after two rotations: got %d, want 2", len(pending))
+	}
+
+	if err := sm.MarkUploaded(pending[0].ID); err != nil {
+		t.Fatalf("MarkUploaded: %v", err)
+	}
+
+	pending2 := sm.PendingUploads()
+	if len(pending2) != 1 {
+		t.Fatalf("pending after one upload: got %d, want 1", len(pending2))
+	}
+	if pending2[0].ID == pending[0].ID {
+		t.Errorf("MarkUploaded did not transition segment %d", pending[0].ID)
+	}
+
+	// Idempotency.
+	if err := sm.MarkUploaded(pending[0].ID); err != nil {
+		t.Errorf("MarkUploaded second call: %v", err)
+	}
+}
+
+func TestUploadState_RecordFailurePersists(t *testing.T) {
+	sm, dir := newTestManager(t)
+	writeN(t, sm, 3)
+	if err := sm.Rotate(); err != nil {
+		t.Fatalf("Rotate: %v", err)
+	}
+	pending := sm.PendingUploads()
+	if len(pending) != 1 {
+		t.Fatalf("pending: got %d, want 1", len(pending))
+	}
+	id := pending[0].ID
+
+	if err := sm.RecordUploadFailure(id, "s3: timeout"); err != nil {
+		t.Fatalf("RecordUploadFailure: %v", err)
+	}
+	if err := sm.RecordUploadFailure(id, "s3: 503"); err != nil {
+		t.Fatalf("RecordUploadFailure: %v", err)
+	}
+
+	// Reopen from disk and check both fields survived.
+	if err := sm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	sm2, err := OpenSegmentManager(dir, DefaultRotationPolicy)
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer sm2.Close()
+
+	// Close seals the active segment, so reopen may surface more than one
+	// pending entry. Find the one we recorded failures against and assert
+	// counters survived the round-trip.
+	var found SegmentMeta
+	var ok bool
+	for _, seg := range sm2.PendingUploads() {
+		if seg.ID == id {
+			found = seg
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		t.Fatalf("segment %d missing from pending after reopen", id)
+	}
+	if found.UploadAttempts != 2 {
+		t.Errorf("UploadAttempts: got %d, want 2", found.UploadAttempts)
+	}
+	if found.LastUploadErr != "s3: 503" {
+		t.Errorf("LastUploadErr: got %q, want %q", found.LastUploadErr, "s3: 503")
+	}
+}

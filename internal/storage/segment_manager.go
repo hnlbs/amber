@@ -440,6 +440,68 @@ func (sm *SegmentManager) Segments() []SegmentMeta {
 	return result
 }
 
+// PendingUploads returns sealed segments whose UploadState is not Uploaded.
+// Used by the background uploader to find work after seal and after restart.
+// Returned slice is a snapshot; callers may mutate it freely.
+func (sm *SegmentManager) PendingUploads() []SegmentMeta {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var pending []SegmentMeta
+	for _, s := range sm.meta.Segments {
+		if s.Sealed && s.UploadState != UploadStateUploaded {
+			pending = append(pending, s)
+		}
+	}
+	return pending
+}
+
+// MarkUploaded transitions a sealed segment to UploadStateUploaded and
+// persists the meta. Idempotent: calling on an already-uploaded segment is
+// a no-op. Returns an error only if the segment ID is unknown or meta
+// persistence fails.
+func (sm *SegmentManager) MarkUploaded(id uint32) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		if sm.meta.Segments[i].UploadState == UploadStateUploaded {
+			return nil
+		}
+		sm.meta.Segments[i].UploadState = UploadStateUploaded
+		sm.meta.Segments[i].UploadAttempts = 0
+		sm.meta.Segments[i].LastUploadErr = ""
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return fmt.Errorf("segmgr: mark uploaded: unknown segment id %d", id)
+}
+
+// RecordUploadFailure increments the failure counter and stores a truncated
+// error message. Persists meta so attempt counts survive restart, driving
+// backoff convergence even across crashes.
+func (sm *SegmentManager) RecordUploadFailure(id uint32, errMsg string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	const maxErrLen = 256
+	if len(errMsg) > maxErrLen {
+		errMsg = errMsg[:maxErrLen]
+	}
+
+	for i := range sm.meta.Segments {
+		if sm.meta.Segments[i].ID != id {
+			continue
+		}
+		sm.meta.Segments[i].UploadAttempts++
+		sm.meta.Segments[i].LastUploadErr = errMsg
+		return saveMeta(sm.dir, sm.meta)
+	}
+	return fmt.Errorf("segmgr: record upload failure: unknown segment id %d", id)
+}
+
 func (sm *SegmentManager) WALCorruptRecords() uint64 {
 	if sm.wal == nil {
 		return 0

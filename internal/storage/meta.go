@@ -9,6 +9,20 @@ import (
 
 const metaFileName = "meta.json"
 
+// UploadState tracks the S3 upload lifecycle of a sealed segment. Zero value
+// is UploadStateLocal so segments without the field (older meta.json) are
+// treated as not-yet-uploaded, which is the safe default when S3 is enabled.
+type UploadState uint8
+
+const (
+	// UploadStateLocal: segment exists on local disk only. For nodes without
+	// a remote store this is the terminal state.
+	UploadStateLocal UploadState = 0
+	// UploadStateUploaded: segment and all sidecars are durable in the remote
+	// store. Retention may delete the local copy.
+	UploadStateUploaded UploadState = 1
+)
+
 type SegmentMeta struct {
 	ID          uint32 `json:"id"`
 	FileName    string `json:"file_name"`
@@ -30,6 +44,19 @@ type SegmentMeta struct {
 	// a crash between saveMeta and wal.Truncate would re-apply them and create
 	// duplicates. Only meaningful while !Sealed.
 	LastSyncedSeq uint64 `json:"last_synced_seq,omitempty"`
+
+	// UploadState tracks remote-store upload progress for sealed segments.
+	// Only meaningful when Sealed=true and a remote SegmentStore is configured.
+	UploadState UploadState `json:"upload_state,omitempty"`
+
+	// UploadAttempts counts failed upload attempts since the last success.
+	// Reset to zero on UploadStateUploaded. Used to drive backoff in the
+	// background uploader.
+	UploadAttempts uint32 `json:"upload_attempts,omitempty"`
+
+	// LastUploadErr is the most recent upload error message (truncated). Empty
+	// on success. Diagnostic only — never read for control flow.
+	LastUploadErr string `json:"last_upload_err,omitempty"`
 }
 
 type StoreMeta struct {
