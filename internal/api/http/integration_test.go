@@ -22,6 +22,7 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/yaop-labs/amber/internal/config"
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/ingest"
 	"github.com/yaop-labs/amber/internal/query"
@@ -66,7 +67,7 @@ func setupAPIHarness(t *testing.T) *apiHarness {
 	mux := http.NewServeMux()
 	var ready atomic.Bool
 	ready.Store(true)
-	RegisterRoutes(mux, RoutesDeps{Batcher: batcher, Executor: exec, LogManager: logManager, LogSparse: logSparse, IsReady: ready.Load, Logger: log}, RoutesConfig{APIKey: "secret", MaxRequestBytes: 32 << 20})
+	RegisterRoutes(mux, RoutesDeps{Batcher: batcher, Executor: exec, LogManager: logManager, LogSparse: logSparse, IsReady: ready.Load, Logger: log}, RoutesConfig{APIKeys: []config.NamedAPIKey{{Name: "default", Key: "secret"}}, MaxRequestBytes: 32 << 20})
 
 	t.Cleanup(func() {
 		cancel()

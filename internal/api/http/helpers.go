@@ -2,12 +2,26 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/yaop-labs/amber/internal/config"
 )
+
+// apiKeyCtxKey identifies the matched API key name in request context.
+// Private type to avoid cross-package context collisions.
+type apiKeyCtxKey struct{}
+
+// APIKeyNameFromContext returns the matched API key name and true if the
+// request was authenticated, or ("", false) when auth was disabled.
+func APIKeyNameFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(apiKeyCtxKey{}).(string)
+	return v, ok
+}
 
 func ReadyHandler(isReady func() bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,11 +43,23 @@ func MaxBytesMiddleware(limit int64, next http.Handler) http.Handler {
 	})
 }
 
-func APIKeyMiddleware(apiKey string, next http.Handler) http.Handler {
-	if apiKey == "" {
+// APIKeyMiddleware checks the Bearer token against the configured named
+// keys. On a match the key name is stored in the request context so
+// downstream handlers and the access log can attribute the call. An empty
+// keys list disables auth entirely (single-node / dev mode).
+//
+// Comparison is constant-time per candidate key. Iteration order is
+// fixed (config-declared order) — match-time leakage is per-key, not
+// per-key-name, so renaming a key does not expose a side channel.
+func APIKeyMiddleware(keys []config.NamedAPIKey, next http.Handler) http.Handler {
+	if len(keys) == 0 {
 		return next
 	}
-	expected := []byte(apiKey)
+	// Precompute byte slices once; ConstantTimeCompare wants []byte.
+	expected := make([][]byte, len(keys))
+	for i, k := range keys {
+		expected[i] = []byte(k.Key)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -41,11 +67,23 @@ func APIKeyMiddleware(apiKey string, next http.Handler) http.Handler {
 			return
 		}
 		got := []byte(auth[len("Bearer "):])
-		if subtle.ConstantTimeCompare(got, expected) != 1 {
+
+		// Match against every key (no short-circuit) so total work is
+		// independent of key position. A single match wins; ties are
+		// resolved to the first config entry, which is fine because
+		// duplicate keys are an operator misconfiguration.
+		matchedName := ""
+		for i, exp := range expected {
+			if subtle.ConstantTimeCompare(got, exp) == 1 && matchedName == "" {
+				matchedName = keys[i].Name
+			}
+		}
+		if matchedName == "" {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), apiKeyCtxKey{}, matchedName)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

@@ -171,7 +171,7 @@ func run() error {
 		IsReady:    stack.IsReady,
 		Logger:     log,
 	}, amberhttp.RoutesConfig{
-		APIKey:          cfg.API.APIKey,
+		APIKeys:         cfg.API.ResolvedAPIKeys(),
 		MaxRequestBytes: cfg.API.MaxRequestBytes,
 	})
 

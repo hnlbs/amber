@@ -62,6 +62,15 @@ type IngestConfig struct {
 	MaxAttrKeysPerService int           `yaml:"max_attr_keys_per_service"`
 }
 
+// NamedAPIKey is a single (name, key) pair. The name appears in access logs
+// and request context, the key is the bearer token. Multiple entries enable
+// zero-downtime rotation: deploy with both old and new keys present, switch
+// clients, then remove the old entry.
+type NamedAPIKey struct {
+	Name string `yaml:"name"`
+	Key  string `yaml:"key"`
+}
+
 type APIConfig struct {
 	HTTPAddr          string        `yaml:"http_addr"`
 	ReadTimeout       time.Duration `yaml:"read_timeout"`
@@ -69,8 +78,27 @@ type APIConfig struct {
 	WriteTimeout      time.Duration `yaml:"write_timeout"`
 	IdleTimeout       time.Duration `yaml:"idle_timeout"`
 	MaxRequestBytes   int64         `yaml:"max_request_bytes"`
-	APIKey            string        `yaml:"api_key"`
-	GRPCAddr          string        `yaml:"grpc_addr"`
+
+	// APIKey is the legacy single-key field, kept for backward compatibility.
+	// If APIKeys is non-empty it wins; otherwise APIKey acts as a single
+	// entry named "default".
+	APIKey  string        `yaml:"api_key"`
+	APIKeys []NamedAPIKey `yaml:"api_keys"`
+
+	GRPCAddr string `yaml:"grpc_addr"`
+}
+
+// ResolvedAPIKeys returns the effective list of named keys after merging
+// the legacy api_key field with api_keys. If neither is set, returns nil
+// — middleware uses nil/empty as "auth disabled".
+func (c APIConfig) ResolvedAPIKeys() []NamedAPIKey {
+	if len(c.APIKeys) > 0 {
+		return c.APIKeys
+	}
+	if c.APIKey != "" {
+		return []NamedAPIKey{{Name: "default", Key: c.APIKey}}
+	}
+	return nil
 }
 
 type LogConfig struct {
