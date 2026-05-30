@@ -93,3 +93,70 @@ func TestFormatFloat_IntegerCollapses(t *testing.T) {
 		t.Errorf("formatFloat(1.5) = %q, want 1.5", got)
 	}
 }
+
+func TestHistogram_BucketsAreCumulative(t *testing.T) {
+	// Tight buckets covering 1ms..100ms so the asserted counts are easy to
+	// reason about and not coupled to the default constants.
+	hv := NewHistogramVec("test_duration_seconds", "h",
+		[]float64{0.001, 0.01, 0.1}, "kind")
+	h := hv.WithLabelValues("log")
+
+	// Observations: 0.5ms, 5ms, 50ms, 500ms.
+	for _, v := range []float64{0.0005, 0.005, 0.05, 0.5} {
+		h.Observe(v)
+	}
+
+	// Bucket le=0.001 catches 0.0005 only.
+	if got := h.counts[0].Load(); got != 1 {
+		t.Errorf("bucket[0.001]: got %d, want 1", got)
+	}
+	// Bucket le=0.01 catches 0.0005 + 0.005.
+	if got := h.counts[1].Load(); got != 2 {
+		t.Errorf("bucket[0.01]: got %d, want 2", got)
+	}
+	// Bucket le=0.1 catches everything except 0.5.
+	if got := h.counts[2].Load(); got != 3 {
+		t.Errorf("bucket[0.1]: got %d, want 3", got)
+	}
+	// Total count includes the >0.1 observation.
+	if got := h.count.Load(); got != 4 {
+		t.Errorf("count: got %d, want 4", got)
+	}
+}
+
+func TestHistogram_NegativeObservationDropped(t *testing.T) {
+	hv := NewHistogramVec("test_neg_seconds", "h", []float64{1}, "k")
+	h := hv.WithLabelValues("x")
+	h.Observe(-5)
+	if got := h.count.Load(); got != 0 {
+		t.Errorf("negative observation incremented count: %d", got)
+	}
+}
+
+func TestHandler_HistogramExposition(t *testing.T) {
+	hv := NewHistogramVec("amber_test_xy_seconds", "test", []float64{0.01, 0.1}, "kind")
+	hv.WithLabelValues("log").Observe(0.005)
+	hv.WithLabelValues("log").Observe(0.05)
+	hv.WithLabelValues("log").Observe(0.5)
+	RegisterHistogramVec(hv)
+
+	rec := httptest.NewRecorder()
+	Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+
+	body := rec.Body.String()
+	must := []string{
+		`# TYPE amber_test_xy_seconds histogram`,
+		`amber_test_xy_seconds_bucket{kind="log",le="0.01"} 1`,
+		`amber_test_xy_seconds_bucket{kind="log",le="0.1"} 2`,
+		`amber_test_xy_seconds_bucket{kind="log",le="+Inf"} 3`,
+		`amber_test_xy_seconds_count{kind="log"} 3`,
+		// Sum ≈ 0.555; exposition uses formatFloat which prints
+		// non-integers via g-style. The leading "0.55" prefix is enough.
+		`amber_test_xy_seconds_sum{kind="log"} 0.55`,
+	}
+	for _, line := range must {
+		if !strings.Contains(body, line) {
+			t.Errorf("missing line: %q\nbody:\n%s", line, body)
+		}
+	}
+}

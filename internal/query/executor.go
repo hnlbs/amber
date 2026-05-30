@@ -18,6 +18,7 @@ import (
 
 	"github.com/yaop-labs/amber/internal/index"
 	"github.com/yaop-labs/amber/internal/indexer"
+	"github.com/yaop-labs/amber/internal/metrics"
 	"github.com/yaop-labs/amber/internal/model"
 	"github.com/yaop-labs/amber/internal/storage"
 )
@@ -647,7 +648,21 @@ func (e *Executor) scanActiveServices(seen map[string]struct{}) {
 	}
 }
 
-func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (*LogResult, error) {
+func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err error) {
+	start := time.Now()
+	defer func() {
+		metrics.QueryDuration.WithLabelValues("log").Observe(time.Since(start).Seconds())
+		if err != nil {
+			metrics.QueryErrors.WithLabelValues("log").Inc()
+			return
+		}
+		cache := "miss"
+		if r != nil && r.CacheHit {
+			cache = "hit"
+		}
+		metrics.QueryTotal.WithLabelValues("log", cache).Inc()
+	}()
+
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
@@ -957,7 +972,22 @@ func (e *Executor) execLogSegment(
 	return matched, nil
 }
 
-func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (*SpanResult, error) {
+func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, err error) {
+	start := time.Now()
+	cacheHit := false
+	defer func() {
+		metrics.QueryDuration.WithLabelValues("span").Observe(time.Since(start).Seconds())
+		if err != nil {
+			metrics.QueryErrors.WithLabelValues("span").Inc()
+			return
+		}
+		cache := "miss"
+		if cacheHit {
+			cache = "hit"
+		}
+		metrics.QueryTotal.WithLabelValues("span", cache).Inc()
+	}()
+
 	if err := q.Validate(); err != nil {
 		return nil, err
 	}
@@ -966,6 +996,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (*SpanResult, err
 
 	for {
 		if cached, ok := e.resultCache.getSpan(cacheKey); ok {
+			cacheHit = true
 			return cached, nil
 		}
 		wait, done := e.resultCache.waitOrStart(cacheKey)

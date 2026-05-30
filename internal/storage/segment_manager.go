@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/yaop-labs/amber/internal/metrics"
 )
 
 type RotationPolicy struct {
@@ -233,7 +236,10 @@ func (sm *SegmentManager) Write(data []byte, ts int64) error {
 
 	payload := makeWALPayload(ts, data)
 
+	walStart := time.Now()
 	seq, err := sm.wal.Write(payload)
+	metrics.WALWriteDuration.WithLabelValues("single").Observe(time.Since(walStart).Seconds())
+	metrics.WALWrites.WithLabelValues("single").Inc()
 	if err != nil {
 		return fmt.Errorf("segmgr: wal write: %w", err)
 	}
@@ -270,7 +276,10 @@ func (sm *SegmentManager) WriteBatch(items []BatchItem) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	walStart := time.Now()
 	firstSeq, err := sm.wal.WriteBatchTS(items)
+	metrics.WALWriteDuration.WithLabelValues("batch").Observe(time.Since(walStart).Seconds())
+	metrics.WALWrites.WithLabelValues("batch").Inc()
 	if err != nil {
 		return fmt.Errorf("segmgr: wal batch: %w", err)
 	}
@@ -404,9 +413,17 @@ func (sm *SegmentManager) rotate() error {
 		onSeal := sm.onSeal
 		onSealComplete := sm.onSealComplete
 		go func() {
+			// SealDuration covers the index-build path that gates query
+			// readiness for this segment. onSealComplete (S3 upload kick)
+			// is excluded because it's fire-and-forget with its own
+			// background retry loop. The label uses dir basename (logs/
+			// spans) so dashboards can split log vs span without storage
+			// growing a domain-aware API.
+			sealStart := time.Now()
 			if onSeal != nil {
 				onSeal(sealedMeta)
 			}
+			metrics.SealDuration.WithLabelValues(filepath.Base(sm.dir)).Observe(time.Since(sealStart).Seconds())
 			if onSealComplete != nil {
 				onSealComplete(sealedMeta)
 			}

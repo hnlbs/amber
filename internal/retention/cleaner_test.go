@@ -167,6 +167,37 @@ func TestCleaner_RequireUploadedSkipsLocalOnly(t *testing.T) {
 	}
 }
 
+func TestSelectForDeletion_ReasonLabels(t *testing.T) {
+	// Three segments with progressively newer MaxTS. Policy targets MaxAge so
+	// the two old ones are picked. The third is picked by MaxSegments=1.
+	old := time.Now().Add(-72 * time.Hour).UnixNano()
+	now := time.Now().UnixNano()
+	cleaner, manager, _ := setupTestCleaner(t, Policy{MaxAge: 48 * time.Hour, MaxSegments: 1}, 0)
+	defer manager.Close()
+
+	segs := []storage.SegmentMeta{
+		{ID: 1, FileName: "seg_1.alog", MaxTS: old},
+		{ID: 2, FileName: "seg_2.alog", MaxTS: old},
+		{ID: 3, FileName: "seg_3.alog", MaxTS: now, SizeBytes: 1024},
+	}
+
+	got := cleaner.selectForDeletion(segs)
+
+	byID := map[uint32]string{}
+	for _, c := range got {
+		byID[c.seg.ID] = c.reason
+	}
+	if byID[1] != "max_age" {
+		t.Errorf("seg 1: reason=%q, want max_age", byID[1])
+	}
+	if byID[2] != "max_age" {
+		t.Errorf("seg 2: reason=%q, want max_age", byID[2])
+	}
+	if byID[3] != "" {
+		t.Errorf("seg 3 should not be selected (MaxSegments leaves it as the youngest): reason=%q", byID[3])
+	}
+}
+
 func TestFilterOut(t *testing.T) {
 	all := []storage.SegmentMeta{
 		{ID: 1, FileName: "seg_1"},

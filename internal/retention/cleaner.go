@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/yaop-labs/amber/internal/index"
+	"github.com/yaop-labs/amber/internal/metrics"
 	"github.com/yaop-labs/amber/internal/storage"
 )
 
@@ -83,34 +84,42 @@ func (c *Cleaner) Run() (int, error) {
 	}
 
 	deleted := 0
-	for _, seg := range toDelete {
-		if err := c.deleteSegment(seg); err != nil {
+	for _, item := range toDelete {
+		if err := c.deleteSegment(item.seg); err != nil {
 			c.log.Error("failed to delete segment",
-				"file", seg.FileName,
+				"file", item.seg.FileName,
 				"err", err,
 			)
 			continue
 		}
 		deleted++
+		metrics.RetentionEvictions.WithLabelValues(item.reason).Inc()
 	}
 
 	return deleted, nil
 }
 
-func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []storage.SegmentMeta {
-	var toDelete []storage.SegmentMeta
+// evictionCandidate carries the segment and the policy that selected it,
+// so the metric label is accurate even when multiple policies overlap.
+type evictionCandidate struct {
+	seg    storage.SegmentMeta
+	reason string
+}
+
+func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []evictionCandidate {
+	var toDelete []evictionCandidate
 	now := time.Now().UnixNano()
 
 	if c.policy.MaxAge > 0 {
 		cutoff := now - c.policy.MaxAge.Nanoseconds()
 		for _, seg := range segments {
 			if seg.MaxTS < cutoff {
-				toDelete = append(toDelete, seg)
+				toDelete = append(toDelete, evictionCandidate{seg: seg, reason: "max_age"})
 			}
 		}
 	}
 
-	remaining := filterOut(segments, toDelete)
+	remaining := filterOutCandidates(segments, toDelete)
 
 	// MaxSegments and MaxTotalBytes both evict from the oldest end. Sort by
 	// MaxTS ascending so segments[0] is the oldest. Without this we relied on
@@ -122,7 +131,9 @@ func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []storage.Se
 
 	if c.policy.MaxSegments > 0 && len(remaining) > c.policy.MaxSegments {
 		excess := len(remaining) - c.policy.MaxSegments
-		toDelete = append(toDelete, remaining[:excess]...)
+		for _, s := range remaining[:excess] {
+			toDelete = append(toDelete, evictionCandidate{seg: s, reason: "max_segments"})
+		}
 		remaining = remaining[excess:]
 	}
 
@@ -132,12 +143,31 @@ func (c *Cleaner) selectForDeletion(segments []storage.SegmentMeta) []storage.Se
 			totalBytes += seg.SizeBytes
 		}
 		for i := 0; i < len(remaining) && totalBytes > c.policy.MaxTotalBytes; i++ {
-			toDelete = append(toDelete, remaining[i])
+			toDelete = append(toDelete, evictionCandidate{seg: remaining[i], reason: "max_total_bytes"})
 			totalBytes -= remaining[i].SizeBytes
 		}
 	}
 
 	return toDelete
+}
+
+// filterOutCandidates returns segments not present in exclude. Mirrors
+// filterOut but takes the new candidate shape.
+func filterOutCandidates(all []storage.SegmentMeta, exclude []evictionCandidate) []storage.SegmentMeta {
+	if len(exclude) == 0 {
+		return all
+	}
+	excludeSet := make(map[uint32]struct{}, len(exclude))
+	for _, c := range exclude {
+		excludeSet[c.seg.ID] = struct{}{}
+	}
+	result := make([]storage.SegmentMeta, 0, len(all))
+	for _, s := range all {
+		if _, skip := excludeSet[s.ID]; !skip {
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 func (c *Cleaner) deleteSegment(seg storage.SegmentMeta) error {
