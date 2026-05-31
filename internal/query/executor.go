@@ -179,6 +179,14 @@ func (c *queryCache) putLog(key [32]byte, r *LogResult) {
 	if c == nil || r == nil {
 		return
 	}
+	// Skip empty results: caching "0 entries" pins a stale-empty answer
+	// for the whole TTL, which is visibly wrong for embedders that ingest
+	// then immediately query (a typical forager turn-around). Empty results
+	// are also cheap to recompute — the planner short-circuits when there
+	// is nothing to scan.
+	if len(r.Entries) == 0 {
+		return
+	}
 	c.mu.Lock()
 	if len(c.entries) >= c.maxSize {
 		c.sweepLocked()
@@ -192,6 +200,9 @@ func (c *queryCache) putLog(key [32]byte, r *LogResult) {
 
 func (c *queryCache) putSpan(key [32]byte, r *SpanResult) {
 	if c == nil || r == nil {
+		return
+	}
+	if len(r.Spans) == 0 {
 		return
 	}
 	c.mu.Lock()
@@ -686,9 +697,9 @@ func (e *Executor) ExecLog(ctx context.Context, q *LogQuery) (r *LogResult, err 
 	plan := e.planner.Plan(q)
 
 	if len(plan.Segments) == 0 {
-		empty := &LogResult{}
-		e.resultCache.putLog(cacheKey, empty)
-		return empty, nil
+		// Don't cache: queryCache.putLog skips empty results to avoid
+		// pinning a stale "no data" answer over a 5s TTL.
+		return &LogResult{}, nil
 	}
 
 	segs := make([]index.SegmentTimeRange, len(plan.Segments))
@@ -1013,9 +1024,7 @@ func (e *Executor) ExecSpan(ctx context.Context, q *SpanQuery) (r *SpanResult, e
 	plan := spanPlanner.Plan(lq)
 
 	if len(plan.Segments) == 0 {
-		empty := &SpanResult{}
-		e.resultCache.putSpan(cacheKey, empty)
-		return empty, nil
+		return &SpanResult{}, nil
 	}
 
 	segs := make([]index.SegmentTimeRange, len(plan.Segments))

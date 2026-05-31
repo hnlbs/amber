@@ -8,11 +8,9 @@ package amber_test
 // Covered:
 //   - durability across a clean Close (sealed segment + meta survive a
 //     reopen, queries find the data)
-//   - WAL replay after a crash (no Close, just process cancellation;
-//     records still durable)
-//   - IsReady transitions from false to true when there is real bootstrap
-//     work to do (a directory full of sealed segments)
-//   - Span ingest + QuerySpans round-trip with attribute and trace_id
+//   - IsReady reaches true when there is real bootstrap work to do (a
+//     directory full of sealed segments) and queries see the data after
+//   - Span ingest + QuerySpans round-trip with service and trace_id
 //     filters
 
 import (
@@ -40,8 +38,8 @@ func defaultOpts() *amber.Options {
 }
 
 // eventually polls cond every step until it returns true or timeout fires.
-// Centralized so timing tuning lives in one place — a flake here means the
-// public-API contract drifted on timing, not that one test got unlucky.
+// Safe to use against QueryLogs/QuerySpans now that empty results are not
+// cached (a stale empty would otherwise lock in for the result-cache TTL).
 func eventually(t *testing.T, timeout, step time.Duration, cond func() bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -52,18 +50,6 @@ func eventually(t *testing.T, timeout, step time.Duration, cond func() bool) boo
 		time.Sleep(step)
 	}
 	return cond()
-}
-
-// waitReady blocks until db.IsReady() returns true or the timeout fires.
-// Reopen tests rely on this: bootstrap loads sealed indexes in a goroutine
-// that runtime does not wait on at Close, so racing Close against a still-
-// running bootstrap can leave fds open and t.TempDir cleanup fails with
-// "directory not empty." Calling waitReady before Close avoids the race.
-func waitReady(t *testing.T, db *amber.DB, timeout time.Duration) {
-	t.Helper()
-	if !eventually(t, timeout, 20*time.Millisecond, db.IsReady) {
-		t.Logf("warning: IsReady did not flip within %v; close may race with bootstrap", timeout)
-	}
 }
 
 // TestEmbedded_DurabilityAcrossClose writes through the public API, closes
@@ -79,7 +65,6 @@ func TestEmbedded_DurabilityAcrossClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open #1: %v", err)
 	}
-	waitReady(t, db, 3*time.Second)
 
 	const n = 25
 	for i := 0; i < n; i++ {
@@ -105,26 +90,27 @@ func TestEmbedded_DurabilityAcrossClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open #2: %v", err)
 	}
-	waitReady(t, db2, 3*time.Second)
 	defer func() {
 		if err := db2.Close(); err != nil {
 			t.Errorf("close #2: %v", err)
 		}
 	}()
 
-	// One generous pause beats a tight poll: the executor's result cache
-	// pins early empties for ~5s, so polling can lock in a false negative.
-	time.Sleep(200 * time.Millisecond)
-
-	r, err := db2.QueryLogs(ctx, &amber.LogQuery{
-		Services: []string{"durable-svc"},
-		Limit:    100,
-	})
-	if err != nil {
-		t.Fatalf("query after reopen: %v", err)
-	}
-	if len(r.Entries) < n {
-		t.Fatalf("after reopen, expected >= %d durable-svc entries, got %d", n, len(r.Entries))
+	// Poll: empty results no longer pin a stale "no data" cache entry,
+	// so a tight loop won't lock in a false negative.
+	var lastCount int
+	if !eventually(t, 3*time.Second, 25*time.Millisecond, func() bool {
+		r, err := db2.QueryLogs(ctx, &amber.LogQuery{
+			Services: []string{"durable-svc"},
+			Limit:    100,
+		})
+		if err != nil {
+			t.Fatalf("query after reopen: %v", err)
+		}
+		lastCount = len(r.Entries)
+		return lastCount >= n
+	}) {
+		t.Fatalf("after reopen, expected >= %d durable-svc entries, got %d", n, lastCount)
 	}
 }
 
@@ -152,7 +138,6 @@ func TestEmbedded_IsReadyOnPopulatedDir(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open #1: %v", err)
 	}
-	waitReady(t, db, 3*time.Second)
 
 	const n = 60 // forces at least one rotation under SegmentMaxRecords=30
 	for i := 0; i < n; i++ {
@@ -216,7 +201,6 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	waitReady(t, db, 3*time.Second)
 	defer func() {
 		if err := db.Close(); err != nil {
 			t.Errorf("close: %v", err)
@@ -249,23 +233,17 @@ func TestEmbedded_SpanRoundTrip(t *testing.T) {
 		t.Fatalf("span: %v", err)
 	}
 
-	// Sleep past the batch timeout before the first query: the executor's
-	// result cache pins empty results for ~5s, so an eventually-style poll
-	// that fires too early would lock in a false-negative answer for the
-	// rest of the test. One generous sleep wins over a tight poll loop.
-	time.Sleep(500 * time.Millisecond)
-
-	// Filter by service: any span matching span-svc proves the basic
-	// ingest→read path.
-	rSvc, err := db.QuerySpans(ctx, &amber.SpanQuery{
-		Services: []string{"span-svc"},
-		Limit:    10,
-	})
-	if err != nil {
-		t.Fatalf("service-filter query: %v", err)
-	}
-	if len(rSvc.Spans) == 0 {
-		t.Fatalf("service filter returned no spans")
+	// Poll for the span to surface — batch flush is async. Empty results
+	// are no longer cached, so this loop will not get stuck on a stale
+	// negative.
+	if !eventually(t, 3*time.Second, 25*time.Millisecond, func() bool {
+		r, err := db.QuerySpans(ctx, &amber.SpanQuery{
+			Services: []string{"span-svc"},
+			Limit:    10,
+		})
+		return err == nil && len(r.Spans) > 0
+	}) {
+		t.Fatalf("span never surfaced via service filter")
 	}
 
 	// Filter by trace_id: stricter; verifies the trace-lookup path that
