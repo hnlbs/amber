@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -125,6 +126,12 @@ type Stack struct {
 	spanUploader *uploader
 
 	ready *atomic.Bool
+
+	// bootstrapWG gates Close on the LoadSealedIndexes goroutine. Without
+	// this Close can race the goroutine's open file handles against
+	// LogManager.Close, leaving fds dangling — observable as TempDir
+	// cleanup failures in short-lived embedders and tests.
+	bootstrapWG sync.WaitGroup
 }
 
 // IsReady reports whether bootstrap finished loading sealed indexes.
@@ -248,7 +255,10 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 	bootstrap.SetupSealCallbacks(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
 
 	ready := &atomic.Bool{}
+	s := &Stack{ready: ready}
+	s.bootstrapWG.Add(1)
 	go func() {
+		defer s.bootstrapWG.Done()
 		bootstrap.LoadSealedIndexes(ctx, exec, logManager, spanManager, logDir, spanDir, cfg.Logger)
 		if ctx.Err() == nil {
 			ready.Store(true)
@@ -282,19 +292,17 @@ func New(ctx context.Context, opts Options) (*Stack, error) {
 
 	batcher.Start(ctx)
 
-	return &Stack{
-		LogManager:   logManager,
-		SpanManager:  spanManager,
-		LogSparse:    logSparse,
-		SpanSparse:   spanSparse,
-		LogDir:       logDir,
-		SpanDir:      spanDir,
-		Executor:     exec,
-		Batcher:      batcher,
-		logUploader:  logUp,
-		spanUploader: spanUp,
-		ready:        ready,
-	}, nil
+	s.LogManager = logManager
+	s.SpanManager = spanManager
+	s.LogSparse = logSparse
+	s.SpanSparse = spanSparse
+	s.LogDir = logDir
+	s.SpanDir = spanDir
+	s.Executor = exec
+	s.Batcher = batcher
+	s.logUploader = logUp
+	s.spanUploader = spanUp
+	return s, nil
 }
 
 // Close drains the batcher and shuts down storage under ctx's deadline.
@@ -324,6 +332,24 @@ func (s *Stack) Close(ctx context.Context) error {
 	}
 	if s.spanUploader != nil {
 		s.spanUploader.Stop()
+	}
+
+	// Wait for the bootstrap goroutine to release its segment file handles
+	// before we close the managers. ctx was cancelled by the caller (DB.Close
+	// or test cleanup) so the bootstrap workers' inner ctx.Err() checks will
+	// terminate them quickly. Without this wait, LogManager.Close races
+	// against OpenSegmentReader fds and leaves files unlinkable on POSIX too
+	// (we observed this as t.TempDir cleanup failures during short-lived
+	// embedder lifecycles).
+	bsDone := make(chan struct{})
+	go func() {
+		s.bootstrapWG.Wait()
+		close(bsDone)
+	}()
+	select {
+	case <-bsDone:
+	case <-ctx.Done():
+		return fmt.Errorf("runtime: bootstrap drain: %w", ctx.Err())
 	}
 
 	closeDone := make(chan error, 1)

@@ -179,9 +179,13 @@ func TestExecutor_ExecLog_NoSegments_AfterPruning(t *testing.T) {
 // return the cached result with CacheHit=true on the second call. This
 // guards the hot dashboard / benchmark warm-repeat path — if this regresses,
 // p50 latencies on R1-R4 explode because every query re-scans segments.
+//
+// Empty results are no longer cached (an ingest-then-query embedder would
+// otherwise pin a stale empty for 5s), so this test uses a real dataset
+// where the result is non-empty.
 func TestExecutor_ExecLog_CacheHit(t *testing.T) {
-	sm, sparse, _ := setupTestStore(t)
-	exec := NewExecutor(sm, sm, sparse, index.NewSparseIndex())
+	exec, cleanup := buildCursorDataset(t, 50)
+	defer cleanup()
 
 	q := &LogQuery{Services: []string{"api-gateway"}, Limit: 100}
 
@@ -192,6 +196,9 @@ func TestExecutor_ExecLog_CacheHit(t *testing.T) {
 	if first.CacheHit {
 		t.Error("first call should not be a cache hit")
 	}
+	if len(first.Entries) == 0 {
+		t.Fatal("setup gave no entries; can't validate cache behavior")
+	}
 
 	second, err := exec.ExecLog(context.Background(), q)
 	if err != nil {
@@ -199,6 +206,35 @@ func TestExecutor_ExecLog_CacheHit(t *testing.T) {
 	}
 	if !second.CacheHit {
 		t.Error("second call must be a cache hit — repeated identical query within TTL")
+	}
+}
+
+// TestExecutor_ExecLog_EmptyResultNotCached pins the F2 contract: empty
+// results bypass the cache, so a query issued before ingest catches up
+// won't poison subsequent calls.
+func TestExecutor_ExecLog_EmptyResultNotCached(t *testing.T) {
+	sm, sparse, _ := setupTestStore(t)
+	exec := NewExecutor(sm, sm, sparse, index.NewSparseIndex())
+
+	q := &LogQuery{Services: []string{"never"}, Limit: 10}
+
+	first, err := exec.ExecLog(context.Background(), q)
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	if len(first.Entries) != 0 {
+		t.Fatalf("expected empty first result, got %d entries", len(first.Entries))
+	}
+	if first.CacheHit {
+		t.Error("first call shouldn't be a cache hit")
+	}
+
+	second, err := exec.ExecLog(context.Background(), q)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if second.CacheHit {
+		t.Error("empty result must not be cached; second call wrongly read from cache")
 	}
 }
 
